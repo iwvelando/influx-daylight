@@ -87,7 +87,7 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:   "influxdb-database",
-			EnvVar: "INFLUXDB_PASSWORD",
+			EnvVar: "INFLUXDB_DATABASE",
 			Usage:  "database for InfluxDB server",
 		},
 		cli.Float64Flag{
