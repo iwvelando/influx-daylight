@@ -1,86 +1,66 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"log"
-	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/influxdata/influxdb/client/v2"
 	"github.com/nathan-osman/go-sunrise"
 	"github.com/urfave/cli"
 )
 
-const (
-	sunriseString = "sunrise"
-	sunsetString  = "sunset"
-)
-
-func nextTime(latitude, longitude float64) (time.Time, string) {
-	now := time.Now()
+func nextSunriseSunset(latitude, longitude float64, t time.Time) (time.Time, time.Time) {
 	sunriseTime, sunsetTime := sunrise.SunriseSunset(
 		latitude,
 		longitude,
-		now.Year(),
-		now.Month(),
-		now.Day(),
+		t.Year(),
+		t.Month(),
+		t.Day(),
 	)
-	if sunriseTime.After(now) {
-		return sunriseTime, sunriseString
+	if t.After(sunriseTime) {
+		return nextSunriseSunset(latitude, longitude, t.Add(24*time.Hour))
+	} else {
+		return sunriseTime, sunsetTime
 	}
-	if sunsetTime.After(now) {
-		return sunsetTime, sunsetString
-	}
-	now = now.Add(24 * time.Hour)
-	sunriseTime, _ = sunrise.SunriseSunset(
-		latitude,
-		longitude,
-		now.Year(),
-		now.Month(),
-		now.Day(),
-	)
-	return sunriseTime, sunriseString
 }
 
-func addAnnotation(addr, username, password, text string, t time.Time) error {
-	u, err := url.Parse(addr)
+func createBatchPoints(database string, sunriseTime, sunsetTime time.Time) (client.BatchPoints, error) {
+	sunrisePt, err := client.NewPoint(
+		"daylight",
+		nil,
+		map[string]interface{}{"value": true},
+		sunriseTime,
+	)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	u.Path = "/api/annotations"
-	b, err := json.Marshal(map[string]interface{}{
-		"time":     t.Unix(),
-		"isRegion": false,
-		"text":     text,
+	sunsetPt, err := client.NewPoint(
+		"daylight",
+		nil,
+		map[string]interface{}{"value": false},
+		sunsetTime,
+	)
+	if err != nil {
+		return nil, err
+	}
+	bp, err := client.NewBatchPoints(client.BatchPointsConfig{
+		Database:  database,
+		Precision: "s",
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Influx Daylight")
-	if username != "" && password != "" {
-		req.SetBasicAuth(username, password)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-	return nil
+	bp.AddPoints([]*client.Point{sunrisePt, sunsetPt})
+	return bp, nil
 }
 
 func main() {
 	app := cli.NewApp()
 	app.Name = "influxdl"
-	app.Usage = "Insert sunrise and sunset annotations into InfluxDB"
+	app.Usage = "Insert sunrise and sunset points into InfluxDB"
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:   "influxdb-addr",
@@ -98,6 +78,11 @@ func main() {
 			EnvVar: "INFLUXDB_PASSWORD",
 			Usage:  "password for InfluxDB server",
 		},
+		cli.StringFlag{
+			Name:   "influxdb-database",
+			EnvVar: "INFLUXDB_PASSWORD",
+			Usage:  "database for InfluxDB server",
+		},
 		cli.Float64Flag{
 			Name:   "latitude",
 			EnvVar: "LATITUDE",
@@ -111,30 +96,56 @@ func main() {
 	}
 	app.Action = func(c *cli.Context) error {
 
+		log.Print("started")
+		defer log.Print("stopped")
+
+		// Create an InfluxDB client
+		cl, err := client.NewHTTPClient(client.HTTPConfig{
+			Addr:     c.String("influxdb-addr"),
+			Username: c.String("influxdb-username"),
+			Password: c.String("influxdb-password"),
+		})
+		if err != nil {
+			return err
+		}
+		defer cl.Close()
+
 		// Make a channel for receiving a SIGINT or SIGTERM
 		sigChan := make(chan os.Signal)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 		// Loop until the next time occurs or a signal is received
 		for {
-			t, text := nextTime(c.Float64("latitude"), c.Float64("longitude"))
+			sunriseTime, sunsetTime := nextSunriseSunset(
+				c.Float64("latitude"),
+				c.Float64("longitude"),
+				time.Now(),
+			)
 			select {
-			case <-time.After(time.Until(t)):
-				if err := addAnnotation(
-					c.String("influxdb-addr"),
-					c.String("influxdb-username"),
-					c.String("influxdb-password"),
-					text,
-					t,
-				); err != nil {
+			case <-time.After(time.Until(sunriseTime)):
+				bp, err := createBatchPoints(
+					c.String("influxdb-database"),
+					sunriseTime,
+					sunsetTime,
+				)
+				if err != nil {
 					log.Print(err.Error())
+					break
 				}
+				if err := cl.Write(bp); err != nil {
+					log.Print(err.Error())
+					break
+				}
+				continue
 			case <-sigChan:
-				break
+				return nil
+			}
+			select {
+			case <-time.After(30 * time.Second):
+			case <-sigChan:
+				return nil
 			}
 		}
-
-		return nil
 	}
 	if err := app.Run(os.Args); err != nil {
 		log.Fatal(err.Error())
