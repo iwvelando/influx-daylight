@@ -21,7 +21,14 @@ func nextSunriseSunset(latitude, longitude float64, t time.Time) (time.Time, tim
 		t.Day(),
 	)
 	if t.After(sunriseTime) {
-		return nextSunriseSunset(latitude, longitude, t.Add(24*time.Hour))
+		t = t.Add(24 * time.Hour)
+		return sunrise.SunriseSunset(
+			latitude,
+			longitude,
+			t.Year(),
+			t.Month(),
+			t.Day(),
+		)
 	} else {
 		return sunriseTime, sunsetTime
 	}
@@ -31,7 +38,7 @@ func createBatchPoints(database string, sunriseTime, sunsetTime time.Time) (clie
 	sunrisePt, err := client.NewPoint(
 		"daylight",
 		nil,
-		map[string]interface{}{"value": true},
+		map[string]interface{}{"value": 1},
 		sunriseTime,
 	)
 	if err != nil {
@@ -40,7 +47,7 @@ func createBatchPoints(database string, sunriseTime, sunsetTime time.Time) (clie
 	sunsetPt, err := client.NewPoint(
 		"daylight",
 		nil,
-		map[string]interface{}{"value": false},
+		map[string]interface{}{"value": 0},
 		sunsetTime,
 	)
 	if err != nil {
@@ -121,6 +128,7 @@ func main() {
 				c.Float64("longitude"),
 				time.Now(),
 			)
+			log.Printf("waiting for %s", sunriseTime.String())
 			select {
 			case <-time.After(time.Until(sunriseTime)):
 				bp, err := createBatchPoints(
@@ -132,6 +140,7 @@ func main() {
 					log.Print(err.Error())
 					break
 				}
+				log.Print("inserting points...")
 				if err := cl.Write(bp); err != nil {
 					log.Print(err.Error())
 					break
@@ -140,6 +149,7 @@ func main() {
 			case <-sigChan:
 				return nil
 			}
+			log.Print("30 second timeout")
 			select {
 			case <-time.After(30 * time.Second):
 			case <-sigChan:
